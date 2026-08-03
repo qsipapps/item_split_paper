@@ -1,27 +1,43 @@
 import io
 import re
+import unicodedata
 from collections import OrderedDict
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v8", layout="wide")
-st.title("PDF Paper Split Demo v8")
-st.caption("Always attempts group extraction; falls back to paper-only when no group header is found.")
+st.set_page_config(page_title="Paper Split Demo v10", layout="wide")
+st.title("PDF Paper Split Demo v10")
+st.caption("Uses fuzzy normalized subject-title matching for group detection.")
 
 # -------------------------------------------------------------------
-# Helpers
+# Normalization
 # -------------------------------------------------------------------
 
 def norm_text(s):
     if s is None:
         return ""
-    return re.sub(r"\s+", " ", str(s)).strip()
+    s = str(s)
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
-def compact_text(s):
-    return re.sub(r"\s+", "", norm_text(s))
+def fuzzy_text(s):
+    s = norm_text(s)
+    s = s.lower()
+    s = s.replace("＆", "and")
+    s = s.replace("和", "")
+    s = s.replace("與", "")
+    s = s.replace("、", "")
+    s = s.replace("，", "")
+    s = s.replace(",", "")
+    s = s.replace("（", "(").replace("）", ")")
+    s = s.replace("–", "-").replace("—", "-")
+    s = s.replace("・", "")
+    s = re.sub(r"[\s\-_/()]+", "", s)
+    return s
 
 
 def safe_float(v, default=None):
@@ -49,22 +65,129 @@ def page_top_text(page, y_max=180):
 
 def is_item_header_line(line):
     s = norm_text(line)
-    c = compact_text(s).lower()
+    c = fuzzy_text(s)
     return ("項目分析" in s or "itemanalysis" in c)
 
 
 # -------------------------------------------------------------------
-# Section / paper / group detection
+# Group dictionary
 # -------------------------------------------------------------------
+
+GROUP_LABELS = [
+    "生物 Biology",
+    "企業、會計與財務概論會計 Business, Accounting and Financial Studies Accounting",
+    "企業、會計與財務概論商業管理 Business, Accounting and Financial Studies Business Management",
+    "化學 Chemistry",
+    "中國歷史 Chinese History",
+    "中國語文 Chinese Language",
+    "中國文學 Chinese Literature",
+    "設計與應用科技 Design and Applied Technology",
+    "經濟 Economics",
+    "英國語文 English Language",
+    "倫理與宗教 Ethics and Religious Studies",
+    "地理 Geography",
+    "健康管理與社會關懷 Health Management and Social Care",
+    "歷史 History",
+    "資訊及通訊科技 Information and Communication Technology",
+    "英語文學 Literature in English",
+    "數學必修部分 Mathematics Compulsory Part",
+    "數學延伸部分(微積分與統計) Mathematics Extended Part(Calculus and Statistics)",
+    "數學延伸部分(代數與微積分) Mathematics Extended Part(Algebra and Calculus)",
+    "音樂 Music",
+    "體育 Physical Education",
+    "物理 Physics",
+    "科技與生活-食品科學與科技 Food Science and Technology",
+    "科技與生活-服裝、成衣與紡織 Fashion,Clothing and Textiles",
+    "旅遊與款待 Tourism and Hospitality Studies",
+    "視覺藝術 Visual Arts",
+]
+
+
+def group_aliases(label):
+    # manual aliases plus fuzzy-normalized fallback variants
+    aliases = [label]
+    zh = label.split(" ")[0]
+    en = label[len(zh):].strip() if len(label) > len(zh) else ""
+    if zh:
+        aliases.append(zh)
+    if en:
+        aliases.append(en)
+
+    alias_map = {
+        "生物 Biology": ["biology", "生物"],
+        "化學 Chemistry": ["chemistry", "化學"],
+        "中國歷史 Chinese History": ["chinesehistory", "中國歷史"],
+        "中國語文 Chinese Language": ["chineselanguage", "中國語文"],
+        "中國文學 Chinese Literature": ["chineseliterature", "中國文學"],
+        "設計與應用科技 Design and Applied Technology": ["designandappliedtechnology", "設計與應用科技", "dat"],
+        "經濟 Economics": ["economics", "經濟"],
+        "英國語文 English Language": ["englishlanguage", "英國語文"],
+        "倫理與宗教 Ethics and Religious Studies": ["ethicsandreligiousstudies", "倫理與宗教"],
+        "地理 Geography": ["geography", "地理"],
+        "健康管理與社會關懷 Health Management and Social Care": ["healthmanagementandsocialcare", "健康管理與社會關懷"],
+        "歷史 History": ["history", "歷史"],
+        "資訊及通訊科技 Information and Communication Technology": ["informationandcommunicationtechnology", "資訊及通訊科技", "ict"],
+        "英語文學 Literature in English": ["literatureinenglish", "英語文學"],
+        "數學必修部分 Mathematics Compulsory Part": ["mathematicscompulsorypart", "數學必修部分", "mathscompulsorypart", "mathcompulsorypart"],
+        "數學延伸部分(微積分與統計) Mathematics Extended Part(Calculus and Statistics)": [
+            "mathematicsextendedpartcalculusandstatistics",
+            "數學延伸部分微積分與統計",
+            "mathsextendedpartcalculusandstatistics",
+            "extendedpartcalculusandstatistics",
+            "calculusandstatistics",
+        ],
+        "數學延伸部分(代數與微積分) Mathematics Extended Part(Algebra and Calculus)": [
+            "mathematicsextendedpartalgebraandcalculus",
+            "數學延伸部分代數與微積分",
+            "mathsextendedpartalgebraandcalculus",
+            "extendedpartalgebraandcalculus",
+            "algebraandcalculus",
+        ],
+        "音樂 Music": ["music", "音樂"],
+        "體育 Physical Education": ["physicaleducation", "體育"],
+        "物理 Physics": ["physics", "物理"],
+        "科技與生活-食品科學與科技 Food Science and Technology": ["foodscienceandtechnology", "科技與生活食品科學與科技", "foodscience", "technology"],
+        "科技與生活-服裝、成衣與紡織 Fashion,Clothing and Textiles": ["fashionclothingandtextiles", "科技與生活服裝成衣與紡織", "clothingandtextiles"],
+        "旅遊與款待 Tourism and Hospitality Studies": ["tourismandhospitalitystudies", "旅遊與款待"],
+        "視覺藝術 Visual Arts": ["visualarts", "視覺藝術"],
+        "企業、會計與財務概論會計 Business, Accounting and Financial Studies Accounting": [
+            "businessaccountingandfinancialstudiesaccounting",
+            "企業會計與財務概論會計",
+            "bafsaccounting",
+        ],
+        "企業、會計與財務概論商業管理 Business, Accounting and Financial Studies Business Management": [
+            "businessaccountingandfinancialstudiesbusinessmanagement",
+            "企業會計與財務概論商業管理",
+            "bafsbusinessmanagement",
+        ],
+    }
+    aliases.extend(alias_map.get(label, []))
+    return list(dict.fromkeys(a for a in aliases if a))
+
+
+GROUP_ALIASES = [(label, [fuzzy_text(a) for a in group_aliases(label)]) for label in GROUP_LABELS]
+
+
+def detect_group_marker(text):
+    t = norm_text(text)
+    if not t:
+        return None
+    ft = fuzzy_text(t)
+    for label, aliases in GROUP_ALIASES:
+        for alias in aliases:
+            if alias and alias in ft:
+                return label
+    return None
+
 
 def detect_section(text):
     t = norm_text(text)
-    c = compact_text(t).lower()
-    if "項目分析" in t or "itemanalysis" in c:
+    ft = fuzzy_text(t)
+    if "項目分析" in t or "itemanalysis" in ft:
         return "item"
-    if "多項選擇題分析" in t or "multiplechoicequestionanalysis" in c:
+    if "多項選擇題分析" in t or "multiplechoicequestionanalysis" in ft:
         return "mcq"
-    if "甲類學科成績" in t or "categoryasubjectresults" in c:
+    if "甲類學科成績" in t or "categoryasubjectresults" in ft:
         return "category"
     return None
 
@@ -93,51 +216,11 @@ def detect_paper_marker(text):
     return None
 
 
-def detect_group_marker(text):
-    t = norm_text(text)
-    if not t:
-        return None
-
-    patterns = [
-        r"(英國語文)",
-        r"(中國語文)",
-        r"(地理)",
-        r"(數學必修部分)",
-        r"(數學延伸部分[（(]微積分與統計[）)])",
-        r"(數學延伸部分[（(]代數與微積分[）)])",
-        r"(English\s*Language)",
-        r"(Chinese\s*Language)",
-        r"(Geography)",
-        r"(Maths\s*Core)",
-        r"(Extended\s*Maths\s*[\-–—]\s*Calculus\s*and\s*Statistics)",
-        r"(Extended\s*Maths\s*[\-–—]\s*Algebra\s*and\s*Calculus)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, t, flags=re.IGNORECASE)
-        if m:
-            return norm_text(m.group(1))
-    return None
-
-
 def derive_group_fallback(page_text, paper):
-    text = norm_text(page_text)
-    # Use likely subject headers when no explicit group header is captured.
-    subjects = [
-        "英國語文",
-        "中國語文",
-        "地理",
-        "數學必修部分",
-        "數學延伸部分（微積分與統計）",
-        "數學延伸部分（代數與微積分）",
-        "English Language",
-        "Chinese Language",
-        "Geography",
-        "Maths Core",
-    ]
-    for subj in subjects:
-        if subj in text:
-            return subj
-
+    ft = fuzzy_text(page_text)
+    for label, aliases in GROUP_ALIASES:
+        if any(a in ft for a in aliases if a):
+            return label
     p = norm_text(paper).upper()
     if p in {"PAPER 1", "PAPER 1A", "PAPER 1B1", "PAPER 1B2"}:
         return "Paper 1"
@@ -319,10 +402,10 @@ uploaded = st.file_uploader("Upload SSR PDF", type=["pdf"])
 with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
-- The app always attempts to extract group names.
-- Group headers are taken from page tops, section headers, and nearby text.
-- Typical subject titles such as `英國語文`, `中國語文`, and `地理` are treated as group candidates.
+- Uses fuzzy normalized matching for subject/group detection.
+- Handles Chinese, English, punctuation, spacing, and full-width/half-width differences.
 - Final key is always `group | paper`.
+- If a subject header is not found exactly, the app tries fuzzy aliases before falling back to `Unknown Group`.
         """
     )
 
@@ -343,7 +426,7 @@ try:
         st.download_button(
             "Download Excel (multi-sheet)",
             data=to_excel_bytes(paper_map),
-            file_name="paper_split_v8.xlsx",
+            file_name="paper_split_v10.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
