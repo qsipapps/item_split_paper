@@ -6,13 +6,13 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v3", layout="wide")
-st.title("PDF Paper Split Demo v3")
-st.caption("Goal: reliably split papers first, then parse rows. Uses a permissive approach inspired by your pdf utils.")
+st.set_page_config(page_title="Paper Split Demo v4", layout="wide")
+st.title("PDF Paper Split Demo v4")
+st.caption("Line-level paper switching for same-page multiple papers. Item rows are kept as DataFrames.")
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 # Helpers
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 
 def norm_text(s):
     if s is None:
@@ -43,7 +43,7 @@ def clean_sheet_name(name):
     return name[:31] or "Sheet"
 
 
-def extract_words_text(page, y_max=180):
+def page_top_text(page, y_max=180):
     try:
         words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=True)
         if not words:
@@ -54,9 +54,13 @@ def extract_words_text(page, y_max=180):
         return page.extract_text() or ""
 
 
-# -------------------------------------------------------------------
-# Section and paper detection
-# -------------------------------------------------------------------
+def line_tokens(line):
+    return norm_text(line).split()
+
+
+# ------------------------------------------------------------
+# Section / paper detection
+# ------------------------------------------------------------
 
 def detect_section(text):
     t = norm_text(text)
@@ -70,23 +74,21 @@ def detect_section(text):
     return None
 
 
-def detect_paper_label(text):
-    """Detect paper label from header text.
+def detect_paper_marker(text):
+    """Detect paper marker anywhere in the text.
 
-    This is intentionally permissive.
-    Examples handled:
+    Supports same-page switching, e.g.:
     - 卷 Paper: 1
     - 卷 Paper: 2
-    - 卷 Paper: 1A
     - 地理 卷1A
     - Geography Paper 1A
     - Chinese Language Paper 101
+    - Paper 1
+    - Paper 2
     """
     if not text:
         return None
     t = norm_text(text)
-    c = compact_text(t)
-    cl = c.lower()
 
     patterns = [
         r"卷\s*Paper\s*:\s*([0-9]+[A-Za-z]?)",
@@ -101,23 +103,22 @@ def detect_paper_label(text):
     for pat in patterns:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
-            num = m.group(1)
-            # normalize case and spacing
-            if str(num).upper() == "1A":
+            val = m.group(1)
+            if str(val).upper() == "1A":
                 return "Paper 1A"
-            if str(num) == "101":
+            if str(val) == "101":
                 return "Paper 101"
-            return f"Paper {num}"
+            return f"Paper {val}"
 
-    # fallback for compact headers like "地理卷1A", "ChineseLanguagePaper101"
-    m = re.search(r"(?:卷|Paper)?\s*([0-9]{1,3}[A-Za-z]?)", c, flags=re.IGNORECASE)
+    # broader fallback, but only when explicit paper-ish token exists
+    m = re.search(r"(?:卷|Paper)\s*([0-9]{1,3}[A-Za-z]?)", t, flags=re.IGNORECASE)
     if m:
-        num = m.group(1)
-        if str(num).upper() == "1A":
+        val = m.group(1)
+        if str(val).upper() == "1A":
             return "Paper 1A"
-        if str(num) == "101":
+        if str(val) == "101":
             return "Paper 101"
-        return f"Paper {num}"
+        return f"Paper {val}"
 
     return None
 
@@ -128,63 +129,70 @@ def is_item_header_line(line):
     return ("項目分析" in s or "itemanalysis" in c)
 
 
-def is_likely_item_row(line):
+def line_is_rowish(line):
+    """Permissive row detection.
+
+    We deliberately accept more lines and parse later.
+    """
     s = norm_text(line)
     if not s:
         return False
-    # very permissive: lines starting with item/question identifiers or total rows
+    if is_item_header_line(s):
+        return False
+    if s.startswith("卷 Paper:") or s.startswith("Paper ") or s.startswith("卷"):
+        return False
+    if any(k in s for k in ["Your school", "Day schools", "Difference", "Answer marked", "Chart of difference"]):
+        return False
+    # row-like if it starts with a question/item label or contains a lot of numbers
     return bool(
-        re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\)|[A-Z]\d+|\d+\.\d+)\b", s)
-        or "總分 Total" in s
-        or "Total" in s and re.search(r"Q\d+", s)
+        re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\)|\d+\.\d+)\b", s)
+        or len(re.findall(r"\d+(?:\.\d+)?%?", s)) >= 6
     )
 
 
-# -------------------------------------------------------------------
-# Row parsing
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# Item row parsing
+# ------------------------------------------------------------
 
-def split_numeric_tail(parts, min_count=8):
-    """Try to split a line into [lead text..., numeric tail...] using the tail of numbers.
+def parse_item_row(line):
+    """Parse item row permissively.
 
-    For item tables, the important thing is to not fail completely.
-    We search for the last min_count numeric-like tokens and keep the prefix as item label.
+    Returns dict with raw_line and best-effort columns.
+    The parser is designed to work with varied SSR layouts.
     """
-    numeric_idx = []
-    for i, p in enumerate(parts):
-        if re.fullmatch(r"[\+\-]?(?:\d+(?:,\d{3})*|\d*)(?:\.\d+)?%?", p):
-            numeric_idx.append(i)
-    if len(numeric_idx) < min_count:
-        return None
-    start = numeric_idx[-min_count]
-    return parts[:start], parts[start:]
-
-
-def parse_item_like_line(line):
     s = norm_text(line)
-    if not s:
+    tokens = line_tokens(s)
+    if len(tokens) < 5:
         return None
 
-    # Use whitespace tokenization first.
-    parts = s.split()
-    tail = split_numeric_tail(parts, min_count=8)
-    if tail is None:
-        return None
-    lead, nums = tail
-    if len(lead) < 2:
-        return None
+    # Common item code forms
+    if re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\))$", tokens[0]):
+        itemcode = tokens[0]
+        rest = tokens[1:]
+    elif len(tokens) > 1 and re.match(r"^Q\d+(?:\.\d+)?|Q\d+\([^)]+\)$", tokens[1]):
+        itemcode = tokens[1]
+        rest = tokens[2:]
+    else:
+        # fallback: if the line is numeric-heavy and has a first token that's not an item code,
+        # keep the first token as itemcode so we do not lose rows.
+        itemcode = tokens[0]
+        rest = tokens[1:]
 
-    # The first token of lead is usually item code.
-    itemcode = lead[0]
-    label = " ".join(lead[1:])
+    # Try to separate label from numeric tail by locating the last 8 numeric-like tokens.
+    numeric_positions = [i for i, tok in enumerate(rest) if re.fullmatch(r"[\+\-]?(?:\d+(?:,\d{3})*|\d*)(?:\.\d+)?%?", tok)]
+    if len(numeric_positions) >= 8:
+        tail_start = numeric_positions[-8]
+        label = " ".join(rest[:tail_start])
+        nums = rest[tail_start:tail_start + 8]
+    else:
+        # If we cannot find enough numbers, still keep the row.
+        label = " ".join(rest[:-1]) if len(rest) > 1 else ""
+        nums = []
 
-    # Common 8/9 tail layout; we keep what we can.
-    # Try best effort to map from the end.
-    # Some rows have 8 numeric fields, some 9 or more.
-    data = {
+    row = {
         "itemcode": itemcode,
         "label": label,
-        "raw": s,
+        "raw_line": s,
         "max_mark": None,
         "your_attempted": None,
         "your_mean": None,
@@ -196,106 +204,91 @@ def parse_item_like_line(line):
         "diffpct": None,
     }
 
-    # If there are exactly 8 numeric tail tokens, map them conservatively.
-    # If there are more, we use the last 8 and ignore extras.
-    nums = nums[-8:]
-    if len(nums) < 8:
-        return data
+    # Best-effort field mapping
+    if len(nums) >= 8:
+        row["max_mark"] = safe_float(nums[0], None)
+        row["your_attempted"] = safe_float(nums[1], None)
+        row["your_mean"] = safe_float(nums[2], None)
+        row["your_sd"] = safe_float(nums[3], None)
+        row["day_attempted"] = safe_float(nums[4], None)
+        row["day_mean"] = safe_float(nums[5], None)
+        row["day_sd"] = safe_float(nums[6], None)
+        row["diffpct"] = safe_float(nums[7], None)
+        # Some PDFs place Diff before Diff%; we approximate diff from the percentage when direct diff absent.
+        row["diff"] = row["diffpct"]
 
-    data["max_mark"] = safe_float(nums[0], None)
-    data["your_attempted"] = safe_int(nums[1], None)
-    data["your_mean"] = safe_float(nums[2], None)
-    data["your_sd"] = safe_float(nums[3], None)
-    data["day_attempted"] = safe_float(nums[4], None)
-    data["day_mean"] = safe_float(nums[5], None)
-    data["day_sd"] = safe_float(nums[6], None)
-    data["diff"] = safe_float(nums[6], None)  # placeholder fallback; will improve if needed
-    data["diffpct"] = safe_float(nums[7], None)
-
-    return data
+    return row
 
 
-# -------------------------------------------------------------------
-# Main extractor
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# Extraction
+# ------------------------------------------------------------
 
 @st.cache_data
 def extract_item_analysis_by_paper(filebytes):
-    """Permissive extractor.
+    """Split item analysis into papers line-by-line.
 
-    Strategy:
-    1) Detect item section.
-    2) Detect paper label from header area.
-    3) Keep rows that look like item rows.
-    4) Group rows by paper label.
-
-    This is designed to work even when row parsing is imperfect, so you can at
-    least confirm paper splitting first.
+    Key idea for same-page multi-paper PDFs:
+    - Scan each line in order.
+    - If a line contains a paper marker, switch current paper immediately.
+    - Any subsequent row-like line belongs to that current paper until another marker appears.
     """
     paper_rows = OrderedDict()
     current_section = None
     current_paper = None
-    item_started = False
+    item_mode_started = False
 
     with pdfplumber.open(io.BytesIO(filebytes)) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
             page_text = page.extract_text() or ""
-            top_text = extract_words_text(page, y_max=180)
-            full_text = f"{top_text}\n{page_text}"
+            top_text = page_top_text(page, y_max=180)
+            combined = f"{top_text}\n{page_text}"
 
-            # Section switching
             sec = detect_section(top_text) or detect_section(page_text) or current_section
             if sec:
                 current_section = sec
 
-            # Paper detection from top area first, then whole page.
-            label = detect_paper_label(top_text) or detect_paper_label(page_text)
-
-            # We only care about item section here.
+            # Reset when entering other sections
             if current_section != "item":
-                # reset paper when leaving item section
                 if current_section in {"mcq", "category"}:
                     current_paper = None
-                    item_started = False
+                    item_mode_started = False
                 continue
 
-            # Once item section is entered, paper label can appear on the page.
-            if label:
-                # Avoid treating section headers like "Paper 101" from MCQ if we are in item section.
-                # This demo assumes item paper labels are the ones visible in the item section.
-                current_paper = label
-                item_started = True
-            else:
-                # If we are in item section but paper isn't found yet, keep the previous one.
+            lines = [norm_text(x) for x in page_text.splitlines() if norm_text(x)]
+            if not lines:
+                continue
+
+            # item section line-by-line scan
+            for line in lines:
+                # Update paper on paper-marker lines, anywhere in line.
+                marker = detect_paper_marker(line)
+                if marker:
+                    current_paper = marker
+                    item_mode_started = True
+                    continue
+
+                # Skip header / explanatory lines
+                if is_item_header_line(line):
+                    continue
+
+                # If no paper yet, keep Unknown but do not drop rows.
                 if current_paper is None:
                     current_paper = "Unknown Item Paper"
 
-            # Extract rows line-by-line. We also allow a page to trigger row capture once item started.
-            for raw_line in page_text.splitlines():
-                s = norm_text(raw_line)
-                if not s:
+                if not line_is_rowish(line):
                     continue
 
-                # Skip obvious headers/instructions, but keep anything row-like.
-                if is_item_header_line(s):
-                    continue
-
-                # Very permissive acceptance: if line looks like an item row, keep it.
-                if not is_likely_item_row(s):
-                    continue
-
-                parsed = parse_item_like_line(s)
+                parsed = parse_item_row(line)
                 row = {
                     "paper": current_paper,
                     "source_page": page_no,
-                    "raw_line": s,
+                    "raw_line": line,
                 }
                 if parsed:
                     row.update(parsed)
-
                 paper_rows.setdefault(current_paper, []).append(row)
 
-    # Build DataFrames.
     out = OrderedDict()
     for paper, rows in paper_rows.items():
         df = pd.DataFrame(rows)
@@ -316,7 +309,11 @@ def summary_df(paper_map):
     rows = []
     for paper, df in paper_map.items():
         pages = sorted(set(df["source_page"].tolist())) if "source_page" in df.columns else []
-        rows.append({"paper": paper, "rows": len(df), "pages": ", ".join(map(str, pages))})
+        rows.append({
+            "paper": paper,
+            "rows": len(df),
+            "pages": ", ".join(map(str, pages)),
+        })
     return pd.DataFrame(rows)
 
 
@@ -330,20 +327,20 @@ def to_excel_bytes(paper_map):
     return output.getvalue()
 
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 # UI
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 
 uploaded = st.file_uploader("Upload SSR PDF", type=["pdf"])
 
-with st.expander("What this demo does", expanded=True):
+with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
-- It first tries to detect **item analysis** pages.
-- It then tries to detect a paper label from the top of the page.
-- Every row-like line inside item section is assigned to the current paper.
-- If row parsing is imperfect, the row is still kept as a raw line so you can inspect the split.
-- This is intentionally permissive because your PDFs have varying layouts.
+- This version uses **line-level paper switching**.
+- A line containing a paper marker like `卷 Paper: 1`, `卷 Paper: 2`, `Paper 1A`, `Paper 101` changes the current paper immediately.
+- All row-like lines after that belong to the current paper until the next marker.
+- Item rows are parsed best-effort into a DataFrame; raw lines are preserved.
+- This is intended to handle **multiple papers on the same page**.
         """
     )
 
@@ -365,21 +362,21 @@ try:
         st.download_button(
             "Download Excel (multi-sheet)",
             data=to_excel_bytes(paper_map),
-            file_name="paper_split_v3.xlsx",
+            file_name="paper_split_v4.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
-        st.subheader("Merged Rows")
+        st.subheader("Merged Item DataFrame")
         st.dataframe(merged_df, use_container_width=True)
         st.download_button(
             "Download merged CSV",
             data=merged_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="merged_rows.csv",
+            file_name="merged_item_rows.csv",
             mime="text/csv",
         )
 
     st.divider()
-    st.subheader("Per-paper data")
+    st.subheader("Per-paper DataFrames")
     for paper, df in paper_map.items():
         with st.expander(f"{paper} ({len(df)} rows)", expanded=False):
             st.dataframe(df, use_container_width=True)
@@ -390,8 +387,8 @@ try:
                 mime="text/csv",
                 key=f"csv_{clean_sheet_name(paper)}",
             )
-            raw_count = int(df["raw_line"].notna().sum()) if "raw_line" in df.columns else 0
-            st.caption(f"Raw lines kept: {raw_count}")
+            if "raw_line" in df.columns:
+                st.caption(f"Raw lines kept: {int(df['raw_line'].notna().sum())}")
 
 except Exception as e:
     st.error(f"❌ Error: {e}")
