@@ -109,7 +109,7 @@ def group_aliases(label):
         "中國歷史 Chinese History": ["chinesehistory", "中國歷史"],
         "中國語文 Chinese Language": ["chineselanguage", "中國語文"],
         "中國文學 Chinese Literature": ["chineseliterature", "中國文學"],
-        "設計與應用科技 Design and Applied Technology": ["designandappliedtechnology", "設計與應用科技", "dat"],
+        "設計與應用科技 Design and Applied Technology": ["designandappliedtechnology", "設計與應用科技"],
         "經濟 Economics": ["economics", "經濟"],
         "英國語文 English Language": ["englishlanguage", "英國語文"],
         "倫理與宗教 Ethics and Religious Studies": ["ethicsandreligiousstudies", "倫理與宗教"],
