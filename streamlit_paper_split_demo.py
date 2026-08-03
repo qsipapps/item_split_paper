@@ -7,9 +7,9 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v11", layout="wide")
-st.title("PDF Paper Split Demo v11")
-st.caption("Fixes Economics detection and removes unsafe fallback subject assignment.")
+st.set_page_config(page_title="Paper Split Demo v12", layout="wide")
+st.title("PDF Paper Split Demo v12")
+st.caption("Fixes state leakage so Unknown Paper / group values do not inherit stale subjects.")
 
 # -------------------------------------------------------------------
 # Normalization
@@ -18,10 +18,8 @@ st.caption("Fixes Economics detection and removes unsafe fallback subject assign
 def norm_text(s):
     if s is None:
         return ""
-    s = str(s)
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+    s = unicodedata.normalize("NFKC", str(s))
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def fuzzy_text(s):
@@ -109,7 +107,7 @@ def group_aliases(label):
         "中國歷史 Chinese History": ["chinesehistory", "中國歷史"],
         "中國語文 Chinese Language": ["chineselanguage", "中國語文"],
         "中國文學 Chinese Literature": ["chineseliterature", "中國文學"],
-        "設計與應用科技 Design and Applied Technology": ["designandappliedtechnology", "設計與應用科技"],
+        "設計與應用科技 Design and Applied Technology": ["designandappliedtechnology", "設計與應用科技", "dat"],
         "經濟 Economics": ["economics", "經濟"],
         "英國語文 English Language": ["englishlanguage", "英國語文"],
         "倫理與宗教 Ethics and Religious Studies": ["ethicsandreligiousstudies", "倫理與宗教"],
@@ -191,19 +189,23 @@ def detect_paper_marker(text):
     return None
 
 
-def derive_group_fallback(page_text, paper):
-    # Safe fallback only; never inject unrelated subjects.
+def derive_group_from_text(page_text):
     ft = fuzzy_text(page_text)
     for label, aliases in GROUP_ALIASES:
         if any(alias in ft for alias in aliases if alias):
             return label
+    return None
 
-    # Special safe handling for Math paper naming if only paper token is available.
-    p = norm_text(paper).upper()
-    if p in {"PAPER 1", "PAPER 1A", "PAPER 1B1", "PAPER 1B2"}:
-        return "Paper 1"
 
-    return "Unknown Group"
+def choose_group(page_text, current_group, reset=False):
+    if reset:
+        current_group = None
+    detected = detect_group_marker(page_text)
+    if detected:
+        return detected
+    if current_group:
+        return current_group
+    return derive_group_from_text(page_text) or "Unknown Group"
 
 
 # -------------------------------------------------------------------
@@ -246,20 +248,7 @@ def parse_item_row(line):
         label = " ".join(rest[:-1]) if len(rest) > 1 else ""
         nums = []
 
-    row = {
-        "itemcode": itemcode,
-        "label": label,
-        "raw_line": s,
-        "max_mark": None,
-        "your_attempted": None,
-        "your_mean": None,
-        "your_sd": None,
-        "day_attempted": None,
-        "day_mean": None,
-        "day_sd": None,
-        "diffpct": None,
-    }
-
+    row = {"itemcode": itemcode, "label": label, "raw_line": s, "max_mark": None, "your_attempted": None, "your_mean": None, "your_sd": None, "day_attempted": None, "day_mean": None, "day_sd": None, "diffpct": None}
     if len(nums) >= 8:
         row["max_mark"] = safe_float(nums[0], None)
         row["your_attempted"] = safe_float(nums[1], None)
@@ -269,7 +258,6 @@ def parse_item_row(line):
         row["day_mean"] = safe_float(nums[5], None)
         row["day_sd"] = safe_float(nums[6], None)
         row["diffpct"] = safe_float(nums[7], None)
-
     return row
 
 
@@ -288,23 +276,29 @@ def extract_item_analysis(filebytes):
         for page_no, page in enumerate(pdf.pages, start=1):
             page_text = page.extract_text() or ""
             top_text = page_top_text(page, y_max=180)
-            sec = detect_section(top_text) or detect_section(page_text) or current_section
-            if sec:
-                current_section = sec
+            page_blob = top_text + " " + page_text
 
-            if current_section != "item":
-                if current_section in {"mcq", "category"}:
+            sec = detect_section(top_text) or detect_section(page_text) or current_section
+            if sec and sec != current_section:
+                current_section = sec
+                if current_section != "item":
                     current_group = None
                     current_paper = None
+
+            if current_section != "item":
                 continue
 
             lines = [norm_text(x) for x in page_text.splitlines() if norm_text(x)]
             if not lines:
                 continue
 
-            page_group = detect_group_marker(top_text) or detect_group_marker(page_text)
+            page_group = detect_group_marker(page_blob)
             if page_group:
                 current_group = page_group
+
+            page_has_paper_marker = any(detect_paper_marker(line) for line in lines)
+            if page_has_paper_marker and current_group is None:
+                current_group = choose_group(page_blob, current_group, reset=True)
 
             for line in lines:
                 marker_group = detect_group_marker(line)
@@ -322,8 +316,14 @@ def extract_item_analysis(filebytes):
 
                 if current_paper is None:
                     current_paper = "Unknown Paper"
+
                 if current_group is None:
-                    current_group = derive_group_fallback(top_text + " " + page_text, current_paper)
+                    current_group = choose_group(page_blob, current_group, reset=True)
+                else:
+                    # If the current group is stale and page blob contains another explicit group, refresh it.
+                    detected = detect_group_marker(page_blob)
+                    if detected and detected != current_group:
+                        current_group = detected
 
                 if not line_is_rowish(line):
                     continue
@@ -372,10 +372,10 @@ uploaded = st.file_uploader("Upload SSR PDF", type=["pdf"])
 with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
-- Uses fuzzy normalized matching for subject/group detection.
-- Fixes Economics by matching `經濟` and `Economics` explicitly.
-- Removes unsafe fallback to unrelated subjects like DAT.
-- Final key is always `group | paper`.
+- v12 resets group state when entering item analysis sections.
+- Unknown Paper no longer inherits stale subjects.
+- The page blob is rescanned to refresh the group when the header appears on the same page.
+- Final key remains `group | paper`.
         """
     )
 
@@ -393,35 +393,19 @@ try:
     with c1:
         st.subheader("Summary")
         st.dataframe(summary, use_container_width=True)
-        st.download_button(
-            "Download Excel (multi-sheet)",
-            data=to_excel_bytes(paper_map),
-            file_name="paper_split_v11.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        st.download_button("Download Excel (multi-sheet)", data=to_excel_bytes(paper_map), file_name="paper_split_v12.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with c2:
         merged_df = pd.concat(paper_map.values(), ignore_index=True) if paper_map else pd.DataFrame()
         st.subheader("Merged Item DataFrame")
         st.dataframe(merged_df, use_container_width=True)
-        st.download_button(
-            "Download merged CSV",
-            data=merged_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="merged_item_rows.csv",
-            mime="text/csv",
-        )
+        st.download_button("Download merged CSV", data=merged_df.to_csv(index=False).encode("utf-8-sig"), file_name="merged_item_rows.csv", mime="text/csv")
 
     st.divider()
     st.subheader("Per-paper DataFrames")
     for key, df in paper_map.items():
         with st.expander(f"{key} ({len(df)} rows)", expanded=False):
             st.dataframe(df, use_container_width=True)
-            st.download_button(
-                f"Download {key} CSV",
-                data=df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{clean_sheet_name(key)}.csv",
-                mime="text/csv",
-                key=f"csv_{clean_sheet_name(key)}",
-            )
+            st.download_button(f"Download {key} CSV", data=df.to_csv(index=False).encode("utf-8-sig"), file_name=f"{clean_sheet_name(key)}.csv", mime="text/csv", key=f"csv_{clean_sheet_name(key)}")
             if "raw_line" in df.columns:
                 st.caption(f"Raw lines kept: {int(df['raw_line'].notna().sum())}")
 
