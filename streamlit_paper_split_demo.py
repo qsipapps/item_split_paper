@@ -6,9 +6,9 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v6", layout="wide")
-st.title("PDF Paper Split Demo v6")
-st.caption("Adds group + paper splitting for reports where multiple卷 share the same paper code (e.g. Maths Paper 1).")
+st.set_page_config(page_title="Paper Split Demo v7", layout="wide")
+st.title("PDF Paper Split Demo v7")
+st.caption("Auto-detects repeated paper codes with different section headers and splits by group + paper when needed.")
 
 # -------------------------------------------------------------------
 # Helpers
@@ -74,15 +74,12 @@ def detect_paper_marker(text):
         return None
     t = norm_text(text)
     tokens = t.split()
-
     for i, tok in enumerate(tokens):
         if tok.lower().rstrip(":") == "paper":
             for j in range(i + 1, min(i + 4, len(tokens))):
-                cand = tokens[j].strip().rstrip(":)")
-                cand = re.sub(r"[^0-9A-Za-z]", "", cand)
+                cand = re.sub(r"[^0-9A-Za-z]", "", tokens[j])
                 if re.fullmatch(r"[0-9]{1,3}[A-Za-z]?[0-9]?", cand, flags=re.IGNORECASE):
                     return f"Paper {cand.upper()}"
-
     patterns = [
         r"卷\s*Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
         r"Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
@@ -100,7 +97,6 @@ def detect_group_marker(text):
     t = norm_text(text)
     if not t:
         return None
-
     patterns = [
         r"(數學必修部分)",
         r"(數學延伸部分[（(]微積分與統計[）)])",
@@ -121,6 +117,37 @@ def default_group_for_paper(paper):
     if p in {"PAPER 1", "PAPER 1A", "PAPER 1B1", "PAPER 1B2"}:
         return "Paper 1"
     return ""
+
+
+# -------------------------------------------------------------------
+# Intelligent mode detection
+# -------------------------------------------------------------------
+
+def detect_group_mode(pdf):
+    section_headers = []
+    paper_keys = set()
+    paper_to_groups = {}
+
+    for page in pdf.pages[: min(6, len(pdf.pages))]:
+        page_text = page.extract_text() or ""
+        top_text = page_top_text(page, y_max=180)
+        texts = [top_text, page_text]
+        current_group = None
+        for txt in texts:
+            grp = detect_group_marker(txt)
+            if grp:
+                current_group = grp
+                section_headers.append(grp)
+            p = detect_paper_marker(txt)
+            if p:
+                paper_keys.add(p)
+                if current_group:
+                    paper_to_groups.setdefault(p, set()).add(current_group)
+
+    repeated_papers = any(len(groups) > 1 for groups in paper_to_groups.values())
+    explicit_groups = len(set(section_headers)) >= 2
+    repeated_same_paper = len(paper_keys) < len(section_headers) and len(paper_keys) > 0
+    return bool(explicit_groups or repeated_papers or repeated_same_paper), sorted(set(section_headers))
 
 
 # -------------------------------------------------------------------
@@ -198,13 +225,17 @@ def parse_item_row(line):
 # -------------------------------------------------------------------
 
 @st.cache_data
-def extract_item_analysis_by_group_paper(filebytes):
+def extract_item_analysis(filebytes):
     rows_by_key = OrderedDict()
     current_section = None
     current_group = None
     current_paper = None
+    group_mode = False
 
     with pdfplumber.open(io.BytesIO(filebytes)) as pdf:
+        group_mode, detected_groups = detect_group_mode(pdf)
+        st.session_state["detected_groups"] = detected_groups
+
         for page_no, page in enumerate(pdf.pages, start=1):
             page_text = page.extract_text() or ""
             top_text = page_top_text(page, y_max=180)
@@ -222,15 +253,17 @@ def extract_item_analysis_by_group_paper(filebytes):
             if not lines:
                 continue
 
-            page_group = detect_group_marker(top_text) or detect_group_marker(page_text)
-            if page_group:
-                current_group = page_group
+            if group_mode:
+                page_group = detect_group_marker(top_text) or detect_group_marker(page_text)
+                if page_group:
+                    current_group = page_group
 
             for line in lines:
-                marker_group = detect_group_marker(line)
-                if marker_group:
-                    current_group = marker_group
-                    continue
+                if group_mode:
+                    marker_group = detect_group_marker(line)
+                    if marker_group:
+                        current_group = marker_group
+                        continue
 
                 marker_paper = detect_paper_marker(line)
                 if marker_paper:
@@ -249,9 +282,10 @@ def extract_item_analysis_by_group_paper(filebytes):
                     continue
 
                 parsed = parse_item_row(line)
-                key = f"{current_group} | {current_paper}"
+                key = f"{current_group} | {current_paper}" if group_mode else current_paper
                 row = {
-                    "group": current_group,
+                    "group_mode": group_mode,
+                    "group": current_group if group_mode else "",
                     "paper": current_paper,
                     "paper_key": key,
                     "source_page": page_no,
@@ -268,7 +302,7 @@ def extract_item_analysis_by_group_paper(filebytes):
             continue
         df.insert(0, "rowindex", range(1, len(df) + 1))
         out[key] = df
-    return out
+    return out, bool(group_mode), st.session_state.get("detected_groups", [])
 
 
 def summary_df(paper_map):
@@ -298,10 +332,10 @@ uploaded = st.file_uploader("Upload SSR PDF", type=["pdf"])
 with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
-- v5 already preserves full paper codes like `1B1` and `1B2`.
-- v6 adds a higher-level **group** key for reports that reuse the same paper code across different卷.
-- The final key becomes `group | paper`, e.g. `數學必修部分 | Paper 1`.
-- If no group marker is found, the app falls back to `Unknown Group` or a paper-based default.
+- The app first scans early pages to decide whether **group mode** should be used.
+- Group mode is enabled when it finds repeated paper codes with different section/group headers.
+- If group mode is enabled, the key becomes `group | paper`.
+- If not, it falls back to `paper only`.
         """
     )
 
@@ -310,19 +344,21 @@ if uploaded is None:
     st.stop()
 
 try:
-    paper_map = extract_item_analysis_by_group_paper(uploaded.getvalue())
+    paper_map, group_mode, detected_groups = extract_item_analysis(uploaded.getvalue())
     summary = summary_df(paper_map)
 
-    st.success(f"Detected {len(paper_map)} grouped paper(s).")
+    st.success(f"Detected {len(paper_map)} paper group(s). Group mode: {'ON' if group_mode else 'OFF'}")
+    if detected_groups:
+        st.caption("Detected group headers: " + ", ".join(detected_groups))
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.subheader("Group+Paper Summary")
+        st.subheader("Summary")
         st.dataframe(summary, use_container_width=True)
         st.download_button(
             "Download Excel (multi-sheet)",
             data=to_excel_bytes(paper_map),
-            file_name="paper_split_v6.xlsx",
+            file_name="paper_split_v7.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
@@ -337,7 +373,7 @@ try:
         )
 
     st.divider()
-    st.subheader("Per-group paper DataFrames")
+    st.subheader("Per-paper DataFrames")
     for key, df in paper_map.items():
         with st.expander(f"{key} ({len(df)} rows)", expanded=False):
             st.dataframe(df, use_container_width=True)
