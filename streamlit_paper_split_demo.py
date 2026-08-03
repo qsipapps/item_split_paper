@@ -7,9 +7,9 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v10", layout="wide")
-st.title("PDF Paper Split Demo v10")
-st.caption("Uses fuzzy normalized subject-title matching for group detection.")
+st.set_page_config(page_title="Paper Split Demo v11", layout="wide")
+st.title("PDF Paper Split Demo v11")
+st.caption("Fixes Economics detection and removes unsafe fallback subject assignment.")
 
 # -------------------------------------------------------------------
 # Normalization
@@ -25,8 +25,7 @@ def norm_text(s):
 
 
 def fuzzy_text(s):
-    s = norm_text(s)
-    s = s.lower()
+    s = norm_text(s).lower()
     s = s.replace("＆", "and")
     s = s.replace("和", "")
     s = s.replace("與", "")
@@ -104,15 +103,6 @@ GROUP_LABELS = [
 
 
 def group_aliases(label):
-    # manual aliases plus fuzzy-normalized fallback variants
-    aliases = [label]
-    zh = label.split(" ")[0]
-    en = label[len(zh):].strip() if len(label) > len(zh) else ""
-    if zh:
-        aliases.append(zh)
-    if en:
-        aliases.append(en)
-
     alias_map = {
         "生物 Biology": ["biology", "生物"],
         "化學 Chemistry": ["chemistry", "化學"],
@@ -146,23 +136,14 @@ def group_aliases(label):
         "音樂 Music": ["music", "音樂"],
         "體育 Physical Education": ["physicaleducation", "體育"],
         "物理 Physics": ["physics", "物理"],
-        "科技與生活-食品科學與科技 Food Science and Technology": ["foodscienceandtechnology", "科技與生活食品科學與科技", "foodscience", "technology"],
+        "科技與生活-食品科學與科技 Food Science and Technology": ["foodscienceandtechnology", "科技與生活食品科學與科技", "foodscience"],
         "科技與生活-服裝、成衣與紡織 Fashion,Clothing and Textiles": ["fashionclothingandtextiles", "科技與生活服裝成衣與紡織", "clothingandtextiles"],
         "旅遊與款待 Tourism and Hospitality Studies": ["tourismandhospitalitystudies", "旅遊與款待"],
         "視覺藝術 Visual Arts": ["visualarts", "視覺藝術"],
-        "企業、會計與財務概論會計 Business, Accounting and Financial Studies Accounting": [
-            "businessaccountingandfinancialstudiesaccounting",
-            "企業會計與財務概論會計",
-            "bafsaccounting",
-        ],
-        "企業、會計與財務概論商業管理 Business, Accounting and Financial Studies Business Management": [
-            "businessaccountingandfinancialstudiesbusinessmanagement",
-            "企業會計與財務概論商業管理",
-            "bafsbusinessmanagement",
-        ],
+        "企業、會計與財務概論會計 Business, Accounting and Financial Studies Accounting": ["businessaccountingandfinancialstudiesaccounting", "企業會計與財務概論會計", "bafsaccounting"],
+        "企業、會計與財務概論商業管理 Business, Accounting and Financial Studies Business Management": ["businessaccountingandfinancialstudiesbusinessmanagement", "企業會計與財務概論商業管理", "bafsbusinessmanagement"],
     }
-    aliases.extend(alias_map.get(label, []))
-    return list(dict.fromkeys(a for a in aliases if a))
+    return list(dict.fromkeys(alias_map.get(label, [label.split(" ")[0], label])))
 
 
 GROUP_ALIASES = [(label, [fuzzy_text(a) for a in group_aliases(label)]) for label in GROUP_LABELS]
@@ -203,13 +184,7 @@ def detect_paper_marker(text):
                 cand = re.sub(r"[^0-9A-Za-z]", "", tokens[j])
                 if re.fullmatch(r"[0-9]{1,3}[A-Za-z]?[0-9]?", cand, flags=re.IGNORECASE):
                     return f"Paper {cand.upper()}"
-    patterns = [
-        r"卷\s*Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
-        r"Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
-        r"Paper\s+([0-9]{1,3}[A-Za-z]?[0-9]?)",
-        r"卷\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
-    ]
-    for pat in patterns:
+    for pat in [r"卷\s*Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)", r"Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)", r"Paper\s+([0-9]{1,3}[A-Za-z]?[0-9]?)", r"卷\s*([0-9]{1,3}[A-Za-z]?[0-9]?)"]:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
             return f"Paper {m.group(1).upper()}"
@@ -217,13 +192,17 @@ def detect_paper_marker(text):
 
 
 def derive_group_fallback(page_text, paper):
+    # Safe fallback only; never inject unrelated subjects.
     ft = fuzzy_text(page_text)
     for label, aliases in GROUP_ALIASES:
-        if any(a in ft for a in aliases if a):
+        if any(alias in ft for alias in aliases if alias):
             return label
+
+    # Special safe handling for Math paper naming if only paper token is available.
     p = norm_text(paper).upper()
     if p in {"PAPER 1", "PAPER 1A", "PAPER 1B1", "PAPER 1B2"}:
         return "Paper 1"
+
     return "Unknown Group"
 
 
@@ -239,10 +218,7 @@ def line_is_rowish(line):
         return False
     if any(k in s for k in ["Your school", "Day schools", "Difference", "Chart of difference"]):
         return False
-    return bool(
-        re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\)|\d+\.\d+)\b", s)
-        or len(re.findall(r"\d+(?:\.\d+)?%?", s)) >= 6
-    )
+    return bool(re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\)|\d+\.\d+)\b", s) or len(re.findall(r"\d+(?:\.\d+)?%?", s)) >= 6)
 
 
 def parse_item_row(line):
@@ -354,13 +330,7 @@ def extract_item_analysis(filebytes):
 
                 parsed = parse_item_row(line)
                 key = f"{current_group} | {current_paper}"
-                row = {
-                    "group": current_group,
-                    "paper": current_paper,
-                    "paper_key": key,
-                    "source_page": page_no,
-                    "raw_line": line,
-                }
+                row = {"group": current_group, "paper": current_paper, "paper_key": key, "source_page": page_no, "raw_line": line}
                 if parsed:
                     row.update(parsed)
                 rows_by_key.setdefault(key, []).append(row)
@@ -403,9 +373,9 @@ with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
 - Uses fuzzy normalized matching for subject/group detection.
-- Handles Chinese, English, punctuation, spacing, and full-width/half-width differences.
+- Fixes Economics by matching `經濟` and `Economics` explicitly.
+- Removes unsafe fallback to unrelated subjects like DAT.
 - Final key is always `group | paper`.
-- If a subject header is not found exactly, the app tries fuzzy aliases before falling back to `Unknown Group`.
         """
     )
 
@@ -426,7 +396,7 @@ try:
         st.download_button(
             "Download Excel (multi-sheet)",
             data=to_excel_bytes(paper_map),
-            file_name="paper_split_v10.xlsx",
+            file_name="paper_split_v11.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
