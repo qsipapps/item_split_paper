@@ -6,9 +6,9 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v5", layout="wide")
-st.title("PDF Paper Split Demo v5")
-st.caption("Improved paper detection for 1B1 / 1B2 / 3B1 / 3B2 and same-page paper switches.")
+st.set_page_config(page_title="Paper Split Demo v6", layout="wide")
+st.title("PDF Paper Split Demo v6")
+st.caption("Adds group + paper splitting for reports where multiple卷 share the same paper code (e.g. Maths Paper 1).")
 
 # -------------------------------------------------------------------
 # Helpers
@@ -22,13 +22,6 @@ def norm_text(s):
 
 def compact_text(s):
     return re.sub(r"\s+", "", norm_text(s))
-
-
-def safe_int(v, default=None):
-    try:
-        return int(float(str(v).strip().replace(",", "")))
-    except Exception:
-        return default
 
 
 def safe_float(v, default=None):
@@ -54,12 +47,14 @@ def page_top_text(page, y_max=180):
         return page.extract_text() or ""
 
 
-def line_tokens(line):
-    return norm_text(line).split()
+def is_item_header_line(line):
+    s = norm_text(line)
+    c = compact_text(s).lower()
+    return ("項目分析" in s or "itemanalysis" in c)
 
 
 # -------------------------------------------------------------------
-# Section / paper detection
+# Section / paper / group detection
 # -------------------------------------------------------------------
 
 def detect_section(text):
@@ -74,86 +69,71 @@ def detect_section(text):
     return None
 
 
-def _normalize_paper_code(code):
-    code = norm_text(code)
-    code = code.replace("：", ":").replace("；", ";")
-    code = code.strip()
-    if not code:
-        return None
-    # Keep full paper code, including 1B1 / 1B2 / 3B1 / 3B2.
-    code = re.sub(r"^Paper\s*:?\s*", "", code, flags=re.IGNORECASE)
-    code = re.sub(r"^卷\s*Paper\s*:?\s*", "", code, flags=re.IGNORECASE)
-    code = re.sub(r"^卷\s*", "", code)
-    code = code.strip()
-    if re.fullmatch(r"1A|1B1|1B2|3A|3B1|3B2|101|\d{1,3}[A-Za-z]?[0-9]?", code, flags=re.IGNORECASE):
-        return f"Paper {code.upper()}"
-    return f"Paper {code}"
-
-
 def detect_paper_marker(text):
-    """Detect paper marker robustly.
-
-    Supports:
-    - 卷 Paper: 1A
-    - 卷 Paper: 1B1
-    - 卷 Paper: 1B2
-    - Paper 1A / Paper 1B1 / Paper 3B2
-    - 卷1A / 卷1B1
-    - Geography Paper 1A
-    """
     if not text:
         return None
     t = norm_text(text)
     tokens = t.split()
 
-    # 1) Token-based extraction: find the word Paper and grab the next token(s)
-    #    This is the key fix for 1B1 / 1B2.
     for i, tok in enumerate(tokens):
         if tok.lower().rstrip(":") == "paper":
-            # Candidate tokens after 'Paper'
             for j in range(i + 1, min(i + 4, len(tokens))):
-                cand = tokens[j].strip().rstrip(":")
-                cand = cand.replace("（", "").replace("）", "")
-                cand = cand.replace("(", "").replace(")", "")
-                # Allow forms like 1A, 1B1, 3B2, 101
+                cand = tokens[j].strip().rstrip(":)")
+                cand = re.sub(r"[^0-9A-Za-z]", "", cand)
                 if re.fullmatch(r"[0-9]{1,3}[A-Za-z]?[0-9]?", cand, flags=re.IGNORECASE):
                     return f"Paper {cand.upper()}"
-                # Sometimes the candidate might be split with punctuation in the next token.
-                cand2 = re.sub(r"[^0-9A-Za-z]", "", cand)
-                if re.fullmatch(r"[0-9]{1,3}[A-Za-z]?[0-9]?", cand2, flags=re.IGNORECASE):
-                    return f"Paper {cand2.upper()}"
 
-    # 2) Regex-based extraction around "Paper" / "卷 Paper:"
     patterns = [
         r"卷\s*Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
         r"Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
         r"Paper\s+([0-9]{1,3}[A-Za-z]?[0-9]?)",
         r"卷\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
-        r"([0-9]{1,3}[A-Za-z]?[0-9]?)\s*Paper",
     ]
     for pat in patterns:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
-            return _normalize_paper_code(m.group(1))
-
+            return f"Paper {m.group(1).upper()}"
     return None
 
 
-def is_item_header_line(line):
-    s = norm_text(line)
-    c = compact_text(s).lower()
-    return ("項目分析" in s or "itemanalysis" in c)
+def detect_group_marker(text):
+    t = norm_text(text)
+    if not t:
+        return None
 
+    patterns = [
+        r"(數學必修部分)",
+        r"(數學延伸部分[（(]微積分與統計[）)])",
+        r"(數學延伸部分[（(]代數與微積分[）)])",
+        r"(Maths\s*Core)",
+        r"(Extended\s*Maths\s*[\-–—]\s*Calculus\s*and\s*Statistics)",
+        r"(Extended\s*Maths\s*[\-–—]\s*Algebra\s*and\s*Calculus)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            return norm_text(m.group(1))
+    return None
+
+
+def default_group_for_paper(paper):
+    p = norm_text(paper).upper()
+    if p in {"PAPER 1", "PAPER 1A", "PAPER 1B1", "PAPER 1B2"}:
+        return "Paper 1"
+    return ""
+
+
+# -------------------------------------------------------------------
+# Row parsing
+# -------------------------------------------------------------------
 
 def line_is_rowish(line):
     s = norm_text(line)
-    if not s:
-        return False
-    if is_item_header_line(s):
+    if not s or is_item_header_line(s):
         return False
     if s.startswith("卷 Paper") or s.startswith("Paper ") or s.startswith("卷"):
         return False
-    if any(k in s for k in ["Your school", "Day schools", "Difference", "Answer marked", "Chart of difference"]):
+    if any(k in s for k in ["Your school", "Day schools", "Difference", "Chart of difference"]):
         return False
     return bool(
         re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\)|\d+\.\d+)\b", s)
@@ -161,13 +141,9 @@ def line_is_rowish(line):
     )
 
 
-# -------------------------------------------------------------------
-# Item row parsing
-# -------------------------------------------------------------------
-
 def parse_item_row(line):
     s = norm_text(line)
-    tokens = line_tokens(s)
+    tokens = s.split()
     if len(tokens) < 5:
         return None
 
@@ -201,7 +177,6 @@ def parse_item_row(line):
         "day_attempted": None,
         "day_mean": None,
         "day_sd": None,
-        "diff": None,
         "diffpct": None,
     }
 
@@ -214,7 +189,6 @@ def parse_item_row(line):
         row["day_mean"] = safe_float(nums[5], None)
         row["day_sd"] = safe_float(nums[6], None)
         row["diffpct"] = safe_float(nums[7], None)
-        row["diff"] = row["diffpct"]
 
     return row
 
@@ -224,9 +198,10 @@ def parse_item_row(line):
 # -------------------------------------------------------------------
 
 @st.cache_data
-def extract_item_analysis_by_paper(filebytes):
-    paper_rows = OrderedDict()
+def extract_item_analysis_by_group_paper(filebytes):
+    rows_by_key = OrderedDict()
     current_section = None
+    current_group = None
     current_paper = None
 
     with pdfplumber.open(io.BytesIO(filebytes)) as pdf:
@@ -239,6 +214,7 @@ def extract_item_analysis_by_paper(filebytes):
 
             if current_section != "item":
                 if current_section in {"mcq", "category"}:
+                    current_group = None
                     current_paper = None
                 continue
 
@@ -246,52 +222,60 @@ def extract_item_analysis_by_paper(filebytes):
             if not lines:
                 continue
 
+            page_group = detect_group_marker(top_text) or detect_group_marker(page_text)
+            if page_group:
+                current_group = page_group
+
             for line in lines:
-                marker = detect_paper_marker(line)
-                if marker:
-                    current_paper = marker
+                marker_group = detect_group_marker(line)
+                if marker_group:
+                    current_group = marker_group
+                    continue
+
+                marker_paper = detect_paper_marker(line)
+                if marker_paper:
+                    current_paper = marker_paper
                     continue
 
                 if is_item_header_line(line):
                     continue
 
                 if current_paper is None:
-                    current_paper = "Unknown Item Paper"
+                    current_paper = "Unknown Paper"
+                if current_group is None:
+                    current_group = default_group_for_paper(current_paper) or "Unknown Group"
 
                 if not line_is_rowish(line):
                     continue
 
                 parsed = parse_item_row(line)
+                key = f"{current_group} | {current_paper}"
                 row = {
+                    "group": current_group,
                     "paper": current_paper,
+                    "paper_key": key,
                     "source_page": page_no,
                     "raw_line": line,
                 }
                 if parsed:
                     row.update(parsed)
-                paper_rows.setdefault(current_paper, []).append(row)
+                rows_by_key.setdefault(key, []).append(row)
 
     out = OrderedDict()
-    for paper, rows in paper_rows.items():
+    for key, rows in rows_by_key.items():
         df = pd.DataFrame(rows)
         if df.empty:
             continue
         df.insert(0, "rowindex", range(1, len(df) + 1))
-        out[paper] = df
+        out[key] = df
     return out
-
-
-def merge_paper_dfs(paper_map):
-    if not paper_map:
-        return pd.DataFrame()
-    return pd.concat(paper_map.values(), ignore_index=True)
 
 
 def summary_df(paper_map):
     rows = []
-    for paper, df in paper_map.items():
+    for key, df in paper_map.items():
         pages = sorted(set(df["source_page"].tolist())) if "source_page" in df.columns else []
-        rows.append({"paper": paper, "rows": len(df), "pages": ", ".join(map(str, pages))})
+        rows.append({"paper_key": key, "rows": len(df), "pages": ", ".join(map(str, pages))})
     return pd.DataFrame(rows)
 
 
@@ -299,8 +283,8 @@ def to_excel_bytes(paper_map):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary_df(paper_map).to_excel(writer, index=False, sheet_name="Summary")
-        for paper, df in paper_map.items():
-            df.to_excel(writer, index=False, sheet_name=clean_sheet_name(paper))
+        for key, df in paper_map.items():
+            df.to_excel(writer, index=False, sheet_name=clean_sheet_name(key))
     output.seek(0)
     return output.getvalue()
 
@@ -314,11 +298,10 @@ uploaded = st.file_uploader("Upload SSR PDF", type=["pdf"])
 with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
-- Item pages are scanned **line by line**.
-- A line containing `Paper 1B1`, `Paper 1B2`, `Paper 3B1`, `Paper 3B2`, etc. will switch the current paper.
-- The code now preserves the full paper code after `Paper`, not only the first 1-2 characters.
-- Rows are grouped by the current paper into DataFrames.
-- Raw lines are preserved to make debugging easier.
+- v5 already preserves full paper codes like `1B1` and `1B2`.
+- v6 adds a higher-level **group** key for reports that reuse the same paper code across different卷.
+- The final key becomes `group | paper`, e.g. `數學必修部分 | Paper 1`.
+- If no group marker is found, the app falls back to `Unknown Group` or a paper-based default.
         """
     )
 
@@ -327,23 +310,23 @@ if uploaded is None:
     st.stop()
 
 try:
-    paper_map = extract_item_analysis_by_paper(uploaded.getvalue())
-    merged_df = merge_paper_dfs(paper_map)
+    paper_map = extract_item_analysis_by_group_paper(uploaded.getvalue())
     summary = summary_df(paper_map)
 
-    st.success(f"Detected {len(paper_map)} item paper(s).")
+    st.success(f"Detected {len(paper_map)} grouped paper(s).")
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.subheader("Paper Summary")
+        st.subheader("Group+Paper Summary")
         st.dataframe(summary, use_container_width=True)
         st.download_button(
             "Download Excel (multi-sheet)",
             data=to_excel_bytes(paper_map),
-            file_name="paper_split_v5.xlsx",
+            file_name="paper_split_v6.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
+        merged_df = pd.concat(paper_map.values(), ignore_index=True) if paper_map else pd.DataFrame()
         st.subheader("Merged Item DataFrame")
         st.dataframe(merged_df, use_container_width=True)
         st.download_button(
@@ -354,16 +337,16 @@ try:
         )
 
     st.divider()
-    st.subheader("Per-paper DataFrames")
-    for paper, df in paper_map.items():
-        with st.expander(f"{paper} ({len(df)} rows)", expanded=False):
+    st.subheader("Per-group paper DataFrames")
+    for key, df in paper_map.items():
+        with st.expander(f"{key} ({len(df)} rows)", expanded=False):
             st.dataframe(df, use_container_width=True)
             st.download_button(
-                f"Download {paper} CSV",
+                f"Download {key} CSV",
                 data=df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{clean_sheet_name(paper)}.csv",
+                file_name=f"{clean_sheet_name(key)}.csv",
                 mime="text/csv",
-                key=f"csv_{clean_sheet_name(paper)}",
+                key=f"csv_{clean_sheet_name(key)}",
             )
             if "raw_line" in df.columns:
                 st.caption(f"Raw lines kept: {int(df['raw_line'].notna().sum())}")
