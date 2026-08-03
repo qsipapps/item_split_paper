@@ -6,13 +6,13 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="Paper Split Demo v4", layout="wide")
-st.title("PDF Paper Split Demo v4")
-st.caption("Line-level paper switching for same-page multiple papers. Item rows are kept as DataFrames.")
+st.set_page_config(page_title="Paper Split Demo v5", layout="wide")
+st.title("PDF Paper Split Demo v5")
+st.caption("Improved paper detection for 1B1 / 1B2 / 3B1 / 3B2 and same-page paper switches.")
 
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 
 def norm_text(s):
     if s is None:
@@ -58,9 +58,9 @@ def line_tokens(line):
     return norm_text(line).split()
 
 
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 # Section / paper detection
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 
 def detect_section(text):
     t = norm_text(text)
@@ -74,51 +74,67 @@ def detect_section(text):
     return None
 
 
-def detect_paper_marker(text):
-    """Detect paper marker anywhere in the text.
+def _normalize_paper_code(code):
+    code = norm_text(code)
+    code = code.replace("：", ":").replace("；", ";")
+    code = code.strip()
+    if not code:
+        return None
+    # Keep full paper code, including 1B1 / 1B2 / 3B1 / 3B2.
+    code = re.sub(r"^Paper\s*:?\s*", "", code, flags=re.IGNORECASE)
+    code = re.sub(r"^卷\s*Paper\s*:?\s*", "", code, flags=re.IGNORECASE)
+    code = re.sub(r"^卷\s*", "", code)
+    code = code.strip()
+    if re.fullmatch(r"1A|1B1|1B2|3A|3B1|3B2|101|\d{1,3}[A-Za-z]?[0-9]?", code, flags=re.IGNORECASE):
+        return f"Paper {code.upper()}"
+    return f"Paper {code}"
 
-    Supports same-page switching, e.g.:
-    - 卷 Paper: 1
-    - 卷 Paper: 2
-    - 地理 卷1A
+
+def detect_paper_marker(text):
+    """Detect paper marker robustly.
+
+    Supports:
+    - 卷 Paper: 1A
+    - 卷 Paper: 1B1
+    - 卷 Paper: 1B2
+    - Paper 1A / Paper 1B1 / Paper 3B2
+    - 卷1A / 卷1B1
     - Geography Paper 1A
-    - Chinese Language Paper 101
-    - Paper 1
-    - Paper 2
     """
     if not text:
         return None
     t = norm_text(text)
+    tokens = t.split()
 
+    # 1) Token-based extraction: find the word Paper and grab the next token(s)
+    #    This is the key fix for 1B1 / 1B2.
+    for i, tok in enumerate(tokens):
+        if tok.lower().rstrip(":") == "paper":
+            # Candidate tokens after 'Paper'
+            for j in range(i + 1, min(i + 4, len(tokens))):
+                cand = tokens[j].strip().rstrip(":")
+                cand = cand.replace("（", "").replace("）", "")
+                cand = cand.replace("(", "").replace(")", "")
+                # Allow forms like 1A, 1B1, 3B2, 101
+                if re.fullmatch(r"[0-9]{1,3}[A-Za-z]?[0-9]?", cand, flags=re.IGNORECASE):
+                    return f"Paper {cand.upper()}"
+                # Sometimes the candidate might be split with punctuation in the next token.
+                cand2 = re.sub(r"[^0-9A-Za-z]", "", cand)
+                if re.fullmatch(r"[0-9]{1,3}[A-Za-z]?[0-9]?", cand2, flags=re.IGNORECASE):
+                    return f"Paper {cand2.upper()}"
+
+    # 2) Regex-based extraction around "Paper" / "卷 Paper:"
     patterns = [
-        r"卷\s*Paper\s*:\s*([0-9]+[A-Za-z]?)",
-        r"Paper\s*:\s*([0-9]+[A-Za-z]?)",
-        r"Paper\s*([0-9]+[A-Za-z]?)",
-        r"卷\s*([0-9]+[A-Za-z]?)",
-        r"卷\s*(1A)",
-        r"Paper\s*(1A)",
-        r"卷\s*(101)",
-        r"Paper\s*(101)",
+        r"卷\s*Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
+        r"Paper\s*:\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
+        r"Paper\s+([0-9]{1,3}[A-Za-z]?[0-9]?)",
+        r"卷\s*([0-9]{1,3}[A-Za-z]?[0-9]?)",
+        r"([0-9]{1,3}[A-Za-z]?[0-9]?)\s*Paper",
     ]
     for pat in patterns:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
-            val = m.group(1)
-            if str(val).upper() == "1A":
-                return "Paper 1A"
-            if str(val) == "101":
-                return "Paper 101"
-            return f"Paper {val}"
-
-    # broader fallback, but only when explicit paper-ish token exists
-    m = re.search(r"(?:卷|Paper)\s*([0-9]{1,3}[A-Za-z]?)", t, flags=re.IGNORECASE)
-    if m:
-        val = m.group(1)
-        if str(val).upper() == "1A":
-            return "Paper 1A"
-        if str(val) == "101":
-            return "Paper 101"
-        return f"Paper {val}"
+            return _normalize_paper_code(m.group(1))
 
     return None
 
@@ -130,62 +146,47 @@ def is_item_header_line(line):
 
 
 def line_is_rowish(line):
-    """Permissive row detection.
-
-    We deliberately accept more lines and parse later.
-    """
     s = norm_text(line)
     if not s:
         return False
     if is_item_header_line(s):
         return False
-    if s.startswith("卷 Paper:") or s.startswith("Paper ") or s.startswith("卷"):
+    if s.startswith("卷 Paper") or s.startswith("Paper ") or s.startswith("卷"):
         return False
     if any(k in s for k in ["Your school", "Day schools", "Difference", "Answer marked", "Chart of difference"]):
         return False
-    # row-like if it starts with a question/item label or contains a lot of numbers
     return bool(
         re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\)|\d+\.\d+)\b", s)
         or len(re.findall(r"\d+(?:\.\d+)?%?", s)) >= 6
     )
 
 
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 # Item row parsing
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 
 def parse_item_row(line):
-    """Parse item row permissively.
-
-    Returns dict with raw_line and best-effort columns.
-    The parser is designed to work with varied SSR layouts.
-    """
     s = norm_text(line)
     tokens = line_tokens(s)
     if len(tokens) < 5:
         return None
 
-    # Common item code forms
-    if re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\))$", tokens[0]):
+    if re.match(r"^(?:\d+|Q\d+(?:\.\d+)?|Q\d+\([^)]+\))$", tokens[0], flags=re.IGNORECASE):
         itemcode = tokens[0]
         rest = tokens[1:]
-    elif len(tokens) > 1 and re.match(r"^Q\d+(?:\.\d+)?|Q\d+\([^)]+\)$", tokens[1]):
+    elif len(tokens) > 1 and re.match(r"^Q\d+(?:\.\d+)?$|^Q\d+\([^)]+\)$", tokens[1], flags=re.IGNORECASE):
         itemcode = tokens[1]
         rest = tokens[2:]
     else:
-        # fallback: if the line is numeric-heavy and has a first token that's not an item code,
-        # keep the first token as itemcode so we do not lose rows.
         itemcode = tokens[0]
         rest = tokens[1:]
 
-    # Try to separate label from numeric tail by locating the last 8 numeric-like tokens.
     numeric_positions = [i for i, tok in enumerate(rest) if re.fullmatch(r"[\+\-]?(?:\d+(?:,\d{3})*|\d*)(?:\.\d+)?%?", tok)]
     if len(numeric_positions) >= 8:
         tail_start = numeric_positions[-8]
         label = " ".join(rest[:tail_start])
         nums = rest[tail_start:tail_start + 8]
     else:
-        # If we cannot find enough numbers, still keep the row.
         label = " ".join(rest[:-1]) if len(rest) > 1 else ""
         nums = []
 
@@ -204,7 +205,6 @@ def parse_item_row(line):
         "diffpct": None,
     }
 
-    # Best-effort field mapping
     if len(nums) >= 8:
         row["max_mark"] = safe_float(nums[0], None)
         row["your_attempted"] = safe_float(nums[1], None)
@@ -214,65 +214,47 @@ def parse_item_row(line):
         row["day_mean"] = safe_float(nums[5], None)
         row["day_sd"] = safe_float(nums[6], None)
         row["diffpct"] = safe_float(nums[7], None)
-        # Some PDFs place Diff before Diff%; we approximate diff from the percentage when direct diff absent.
         row["diff"] = row["diffpct"]
 
     return row
 
 
-# ------------------------------------------------------------
-# Extraction
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# Main extractor
+# -------------------------------------------------------------------
 
 @st.cache_data
 def extract_item_analysis_by_paper(filebytes):
-    """Split item analysis into papers line-by-line.
-
-    Key idea for same-page multi-paper PDFs:
-    - Scan each line in order.
-    - If a line contains a paper marker, switch current paper immediately.
-    - Any subsequent row-like line belongs to that current paper until another marker appears.
-    """
     paper_rows = OrderedDict()
     current_section = None
     current_paper = None
-    item_mode_started = False
 
     with pdfplumber.open(io.BytesIO(filebytes)) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
             page_text = page.extract_text() or ""
             top_text = page_top_text(page, y_max=180)
-            combined = f"{top_text}\n{page_text}"
-
             sec = detect_section(top_text) or detect_section(page_text) or current_section
             if sec:
                 current_section = sec
 
-            # Reset when entering other sections
             if current_section != "item":
                 if current_section in {"mcq", "category"}:
                     current_paper = None
-                    item_mode_started = False
                 continue
 
             lines = [norm_text(x) for x in page_text.splitlines() if norm_text(x)]
             if not lines:
                 continue
 
-            # item section line-by-line scan
             for line in lines:
-                # Update paper on paper-marker lines, anywhere in line.
                 marker = detect_paper_marker(line)
                 if marker:
                     current_paper = marker
-                    item_mode_started = True
                     continue
 
-                # Skip header / explanatory lines
                 if is_item_header_line(line):
                     continue
 
-                # If no paper yet, keep Unknown but do not drop rows.
                 if current_paper is None:
                     current_paper = "Unknown Item Paper"
 
@@ -309,11 +291,7 @@ def summary_df(paper_map):
     rows = []
     for paper, df in paper_map.items():
         pages = sorted(set(df["source_page"].tolist())) if "source_page" in df.columns else []
-        rows.append({
-            "paper": paper,
-            "rows": len(df),
-            "pages": ", ".join(map(str, pages)),
-        })
+        rows.append({"paper": paper, "rows": len(df), "pages": ", ".join(map(str, pages))})
     return pd.DataFrame(rows)
 
 
@@ -327,20 +305,20 @@ def to_excel_bytes(paper_map):
     return output.getvalue()
 
 
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 # UI
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 
 uploaded = st.file_uploader("Upload SSR PDF", type=["pdf"])
 
 with st.expander("Splitting logic", expanded=True):
     st.markdown(
         """
-- This version uses **line-level paper switching**.
-- A line containing a paper marker like `卷 Paper: 1`, `卷 Paper: 2`, `Paper 1A`, `Paper 101` changes the current paper immediately.
-- All row-like lines after that belong to the current paper until the next marker.
-- Item rows are parsed best-effort into a DataFrame; raw lines are preserved.
-- This is intended to handle **multiple papers on the same page**.
+- Item pages are scanned **line by line**.
+- A line containing `Paper 1B1`, `Paper 1B2`, `Paper 3B1`, `Paper 3B2`, etc. will switch the current paper.
+- The code now preserves the full paper code after `Paper`, not only the first 1-2 characters.
+- Rows are grouped by the current paper into DataFrames.
+- Raw lines are preserved to make debugging easier.
         """
     )
 
@@ -362,7 +340,7 @@ try:
         st.download_button(
             "Download Excel (multi-sheet)",
             data=to_excel_bytes(paper_map),
-            file_name="paper_split_v4.xlsx",
+            file_name="paper_split_v5.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with c2:
